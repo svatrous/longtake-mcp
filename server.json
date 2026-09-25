@@ -1,18 +1,35 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.svatrous/longtake",
-  "description": "Shoot AI video in Longtake Studio on your own API key: projects, characters with a locked voice, Seedance/Veo/Kling takes, drafts and 1080p finishes, cost estimates",
-  "repository": { "url": "https://github.com/svatrous/longtake-mcp", "source": "github" },
+  "description": "Drive Longtake Studio from an agent: AI video takes on your own API key, characters, drafts, costs",
+  "repository": {
+    "url": "https://github.com/svatrous/longtake-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://longtake.studio/mcp",
   "version": "1.0.0",
   "packages": [
     {
-      "registry_type": "npm",
+      "registryType": "npm",
       "identifier": "longtake-mcp",
       "version": "1.0.0",
-      "transport": { "type": "stdio" },
-      "environment_variables": [
-        { "name": "STUDIO_URL", "description": "Studio address, https://longtake.studio for the cloud studio", "is_required": true },
-        { "name": "STUDIO_TOKEN", "description": "Personal agent token from the studio (account menu → API keys → Agent access)", "is_required": true, "is_secret": true }
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "STUDIO_URL",
+          "description": "Studio address — https://longtake.studio for the cloud studio",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "STUDIO_TOKEN",
+          "description": "Personal agent token from the studio: account menu → API keys → Agent access",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
       ]
     }
   ]
