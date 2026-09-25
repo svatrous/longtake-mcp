@@ -1,0 +1,15 @@
+{
+  "name": "longtake-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Longtake Studio: lets an AI agent shoot AI video (Seedance, Veo, Gemini Omni, Kling) in a studio that runs on your own API key",
+  "main": "mcp-server.js",
+  "bin": { "longtake-mcp": "mcp-server.js" },
+  "mcpName": "io.github.svatrous/longtake",
+  "license": "MIT",
+  "author": "Pavel Ilin",
+  "homepage": "https://longtake.studio/mcp",
+  "repository": { "type": "git", "url": "git+https://github.com/svatrous/longtake-mcp.git" },
+  "keywords": ["mcp", "model-context-protocol", "ai-video", "seedance", "veo", "kling", "video-generation", "claude-code", "longtake"],
+  "engines": { "node": ">=20" },
+  "dependencies": { "@modelcontextprotocol/sdk": "^1.29.0", "zod": "^4.4.3" }
+}
