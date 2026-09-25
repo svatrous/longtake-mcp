@@ -24,20 +24,13 @@ Renders launched by an agent are billed exactly like clicks in the studio: the m
 ## Setup
 
 1. **Issue a token.** In the studio: account menu → **API keys** → **Agent access — MCP** → create. It is shown once and can be revoked alone.
-2. **Get the server.**
-
-   ```bash
-   git clone https://github.com/svatrous/longtake-mcp.git
-   cd longtake-mcp && npm install
-   ```
-
-3. **Register it with your agent.** For Claude Code:
+2. **Register it with your agent.** The package is on npm as [`longtake-mcp`](https://www.npmjs.com/package/longtake-mcp), so `npx` fetches it — nothing to clone. For Claude Code:
 
    ```bash
    claude mcp add longtake \
      -e STUDIO_URL=https://longtake.studio \
      -e STUDIO_TOKEN=cf_your_token \
-     -- node /path/to/longtake-mcp/mcp-server.js
+     -- npx -y longtake-mcp
    ```
 
    Any other MCP client takes the same command and the same two environment variables. As JSON (Cursor, Codex, Claude Desktop):
@@ -46,13 +39,15 @@ Renders launched by an agent are billed exactly like clicks in the studio: the m
    {
      "mcpServers": {
        "longtake": {
-         "command": "node",
-         "args": ["/path/to/longtake-mcp/mcp-server.js"],
+         "command": "npx",
+         "args": ["-y", "longtake-mcp"],
          "env": { "STUDIO_URL": "https://longtake.studio", "STUDIO_TOKEN": "cf_your_token" }
        }
      }
    }
    ```
+
+   Prefer a checkout? `git clone https://github.com/svatrous/longtake-mcp.git && cd longtake-mcp && npm install`, then point the command at `node mcp-server.js`.
 
 The full guide, with what the token can and cannot do, is at [longtake.studio/mcp](https://longtake.studio/mcp). Prompt-writing skills for the same agent (Seedance 2.0, Seedance 2.5, Gemini Omni, character sheets) are at [longtake.studio/skills](https://longtake.studio/skills).
 
