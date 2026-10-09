@@ -3,6 +3,7 @@
 # provenance), and the registry accepts the same GitHub identity for io.github.svatrous/*.
 # The npm side is configured on npmjs.com → longtake-mcp → Settings → Trusted Publisher,
 # and its "Workflow filename" must stay publish.yml.
+# A failed run is safe to re-run as a whole: a version npm already has is not published again.
 name: Publish
 
 on:
@@ -16,10 +17,12 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -27,7 +30,7 @@ jobs:
       # One version in four places, or the registry turns the release down after npm took it.
       - name: Versions agree
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${VERSION#v}"
           pkg=$(node -p "require('./package.json').version")
           srv=$(node -p "require('./server.json').version")
           srvpkg=$(node -p "require('./server.json').packages[0].version")
@@ -38,7 +41,24 @@ jobs:
       # trusted publishing needs npm 11.5.1 or later
       - run: npm install -g npm@^11.5.1
 
-      - run: npm publish
+      - name: npm publish
+        run: |
+          if npm view "longtake-mcp@${VERSION#v}" version >/dev/null 2>&1; then
+            echo "longtake-mcp@${VERSION#v} is already on npm"
+          else
+            npm publish
+          fi
+
+      # npm shows a fresh version only a minute or so later, and the registry turns down a
+      # version it cannot see there (1.0.1 was refused 40 s after npm took it).
+      - name: Wait for npm
+        run: |
+          for i in $(seq 1 60); do
+            npm view "longtake-mcp@${VERSION#v}" version >/dev/null 2>&1 && exit 0
+            sleep 10
+          done
+          echo "longtake-mcp@${VERSION#v} did not show up on npm within 10 minutes"
+          exit 1
 
       - name: MCP Registry
         run: |
