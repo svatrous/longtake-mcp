@@ -1,6 +1,6 @@
 {
   "name": "longtake-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server for Longtake Studio: lets an AI agent shoot AI video (Seedance, Veo, Gemini Omni, Kling) in a studio that runs on your own API key",
   "main": "mcp-server.js",
   "bin": {

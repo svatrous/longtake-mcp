@@ -39,7 +39,21 @@ const STUDIO_DIR = fs.existsSync(path.join(__dirname, 'server.js')) ? __dirname 
    the error object. The code → guide map is not copied here on purpose: it lives in the
    studio (HELP_FOR in public/app.js) and a second copy would drift. */
 function studioError(body, fallback) {
-  const err = new Error(body.error || fallback);
+  /* Two answers carry `message` instead of `error`, and both mean the studio was not there to
+     do anything (WEB-87): its own drain before a deploy ("restarting" — the call was never
+     started) and Railway's edge while the next process boots ("Application failed to
+     respond"). Without this the agent read a bare "HTTP 503" and could not tell it from a
+     refusal worth giving up on. */
+  const restarting = body.status === 'restarting';
+  const edge = !body.error && !restarting && typeof body.message === 'string';
+  const err = new Error(body.error
+    || (restarting && `${body.message} Nothing was started.`)
+    || (edge && `The studio did not answer (${body.message}) — it is restarting or redeploying. Wait a few seconds; before repeating a paid call, check take_status or scene_takes.`)
+    || fallback);
+  if (restarting || edge) {
+    err.body = body;
+    return err; // Railway's `code` is its HTTP status as a number, not a studio code
+  }
   // the rest of the answer too: a refusal can carry what the tool needs next (the final
   // a DRAFT_ALREADY_FINISHED names, the inputs a moderation refusal names)
   err.body = body;
@@ -207,12 +221,25 @@ const noRate = (m, resolution) => (m.resolutions?.includes(resolution)
   ? `Cost estimate unavailable — the studio reports no rate for ${m.id} at ${resolution} (update the studio).`
   : `Cost estimate unavailable — ${m.id} does not shoot ${resolution} (it has ${(m.resolutions || []).join(', ')}).`);
 
-const server = new McpServer({ name: 'seedance-studio', version: '1.0.0' });
+/* Tool annotations: what a call does to the world, for the host. Hosts act on them their own way —
+   Claude Code runs read-only tools in parallel and lets them run in plan mode; a host that confirms
+   writes can let reads through — and fill a missing hint differently: the protocol's default is the
+   cautious one, Claude Code reads it as false. So every tool spells out all four. Open world here
+   means the call acts at a vendor on the user's key (a render, a cancel). A read stays a read even
+   though GET /api/tasks nudges the vendor poll along and GET /api/state scaffolds a first project
+   for an account left with none. */
+const READS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const CREATES = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const RENDERS = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
+const DELETES = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true };
+
+const server = new McpServer({ name: 'seedance-studio', version: '1.0.1' }); // = npm longtake-mcp; bumped with it
 
 server.tool(
   'studio_overview',
   'Studio overview: projects with folders and scenes (ids and names), characters, assets, active renders. Call this first — all other tools use ids from here.',
   {},
+  READS,
   async () => {
     const s = await api('/api/state');
     const overview = {
@@ -258,7 +285,7 @@ server.tool(
   }
 );
 
-server.tool('create_project', 'Create a project (scaffolded with "Episode 1" and "Scene 1").', { name: z.string() }, async ({ name }) => {
+server.tool('create_project', 'Create a project (scaffolded with "Episode 1" and "Scene 1").', { name: z.string() }, CREATES, async ({ name }) => {
   const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name }) });
   const s = await api('/api/state');
   const folder = s.folders.find((f) => f.projectId === p.id);
@@ -266,13 +293,13 @@ server.tool('create_project', 'Create a project (scaffolded with "Episode 1" and
   return text({ project: p, folderId: folder?.id, sceneId: scene?.id });
 });
 
-server.tool('create_folder', 'Create a folder (episode) in a project — a "Scene 1" appears inside.', { projectId: z.string(), name: z.string() }, async (args) => {
+server.tool('create_folder', 'Create a folder (episode) in a project — a "Scene 1" appears inside.', { projectId: z.string(), name: z.string() }, CREATES, async (args) => {
   const f = await api('/api/folders', { method: 'POST', body: JSON.stringify(args) });
   const s = await api('/api/state');
   return text({ folder: f, sceneId: s.scenes.find((sc) => sc.folderId === f.id)?.id });
 });
 
-server.tool('create_scene', 'Create a scene in a folder.', { folderId: z.string(), name: z.string() }, async (args) => {
+server.tool('create_scene', 'Create a scene in a folder.', { folderId: z.string(), name: z.string() }, CREATES, async (args) => {
   return text(await api('/api/scenes', { method: 'POST', body: JSON.stringify(args) }));
 });
 
@@ -285,6 +312,7 @@ server.tool(
     width: z.number().int().positive().optional().describe('frame width of a clip in px (measured with ffprobe when omitted)'),
     height: z.number().int().positive().optional().describe('frame height of a clip in px (measured with ffprobe when omitted)'),
   },
+  CREATES,
   async ({ projectId, filePath, name, durationSec, width, height }) => {
     const dataUrl = fileToDataUrl(filePath);
     const ext = path.extname(filePath).toLowerCase();
@@ -299,6 +327,10 @@ server.tool(
     if (isVideo && !meta && !(durationSec && width && height)) {
       asset.note = 'ffprobe was not found, so the clip went up unmeasured: the studio could not check its length and frame size — pass durationSec, width and height, or the vendor will judge the clip at render time.';
     }
+    // the studio looks for faces in every library picture (asset.faces / faceSize)
+    if (asset.faces > 0) {
+      asset.note = 'There is a face in this picture. If it is a character, cast it: create_character with imageAssetId = this asset\'s id, then mention the character — its portrait goes to the video model prepared against moderation. Mentioned as @name straight from the library (as a location, a prop, any reference), the picture goes exactly as it is, and a photoreal face in it can get the take refused.';
+    }
     return text(asset);
   }
 );
@@ -312,6 +344,7 @@ server.tool(
     photoPaths: z.array(z.string()).max(14).optional().describe('paths to photos of the person (up to 14)'),
     assetName: z.string().optional().describe('name for the @mention; without it the sheet is called "mockup" (then mockup-2, …) — this tool has no character name to build one from'),
   },
+  RENDERS,
   async ({ projectId, description, photoPaths, assetName }) => {
     if (!description && !photoPaths?.length) throw new Error('Need a description and/or photos.');
     const refs = (photoPaths || []).map(fileToDataUrl);
@@ -339,7 +372,7 @@ server.tool(
   {
     projectId: z.string(),
     name: z.string(),
-    imageAssetId: z.string().optional().describe('an existing library asset — it becomes the character\'s portrait and gets the anti-moderation grain at that moment (the clean file stays for previews; the asset itself stays in the library)'),
+    imageAssetId: z.string().optional().describe('an existing library asset — it becomes the character\'s portrait and gets the anti-moderation grain at that moment (the clean file stays for previews; the asset itself stays in the library). If the picture already carries a grain set for a character (another one wears it, or it was a portrait before) and grainLevel asks for a different one, this character gets a copy of its own instead and the picture stays as it is — imageAssetId in the answer then names the copy. Another character\'s own portrait file (not listed in the library) is refused: attach the picture via imageFilePath'),
     imageFilePath: z.string().optional().describe('path to a local character sheet — preferred for a photorealistic face: the file is stored as the character\'s own (not listed in the library) and gets the automatic anti-moderation grain, the way attaching a file in Cast does'),
     voiceAssetId: z.string().optional(),
     voiceFilePath: z.string().optional().describe('path to a 2–15 s voice sample — mp3 or wav only, the video model takes nothing else; all speaking characters in one take share that 15 s window (30 s on Seedance 2.5)'),
@@ -347,6 +380,12 @@ server.tool(
     arkVoiceAsset: z.string().optional(),
     grainLevel: z.number().int().min(10).max(100).optional().describe('strength of the anti-moderation grain on the portrait, 10–100 (default 60): the percent of black the darkest grain cell may reach. Raise it when Seedance 2.5 refuses a face that 2.0 accepts; the clean portrait is kept for previews, only the copy shown to the video model changes'),
   },
+  /* Additive since WEB-57: a new character, its own files, a twin for a picture nobody had
+     treated. A picture whose grain someone else relies on is copied rather than rebuilt, a
+     refusal takes back only what this call made (and puts an untreated library picture back as
+     it was), and the sweep that rides on every character save collects only files nobody can
+     reach — abandoned dialog uploads. */
+  RENDERS,
   async ({ projectId, name, imageAssetId, imageFilePath, voiceAssetId, voiceFilePath, arkImageAsset, arkVoiceAsset, grainLevel }) => {
     /* internal: a file handed to the character belongs to the character, not to the library —
        it is not listed, not @-mentionable and dies with it, exactly as in the cast dialog. */
@@ -372,16 +411,21 @@ server.tool(
       });
       voiceId = a.id;
     }
-    return text(await api('/api/characters', {
+    const saved = await api('/api/characters', {
       method: 'POST',
       body: JSON.stringify({ projectId, name, imageAssetId: imageId, voiceAssetId: voiceId, arkImageAsset: arkImageAsset || null, arkVoiceAsset: arkVoiceAsset || null, grainLevel }),
-    }));
+    });
+    // the studio answers with a copy's id when the picture's grain was somebody else's (WEB-57)
+    if (imageAssetId && saved.imageAssetId && saved.imageAssetId !== imageAssetId) {
+      saved.note = 'That picture already carries a grain set for a character (another one wears it, or it was a portrait before), so this character got a copy of its own at the level asked (imageAssetId now names the copy; portraitAsset describes it). The library picture, and whoever wears it, are unchanged.';
+    }
+    return text(saved);
   }
 );
 
-/* A draft's final: the newest take made from it that has not ended without a render. The
-   same rule as the reel's finalOf (public/app.js) and the studio's own check, which refuses a
-   second final with DRAFT_ALREADY_FINISHED (server.js prepareFinish). */
+/* A draft's final, as take_status shows it: the newest take made from it that has not ended
+   without a render. The same rule as the reel's finalOf (public/app.js) and the studio's own
+   check, which refuses a second final with DRAFT_ALREADY_FINISHED (server.js prepareFinish). */
 const GONE_STATUS = ['failed', 'cancelled', 'expired'];
 const finalOf = (tasks, draftId) => tasks.find((t) => t.finishOf === draftId && !GONE_STATUS.includes(t.status));
 const brief = (t) => ({ id: t.id, takeNo: t.takeNo, status: t.status });
@@ -403,6 +447,7 @@ server.tool(
     cameraPhrases: z.array(z.string()).optional().describe('English camera-movement phrases, e.g. "Slow cinematic dolly in toward the subject."'),
     draft: z.boolean().optional().describe('Seedance 2.5 only: a 480p draft that finish_draft can render again as the same shot in 1080p within 7 days. Billed as an ordinary 480p take. With draft, model defaults to 2.5 and resolution to 480p'),
   },
+  RENDERS,
   async (args) => {
     const s = await api('/api/state');
     const scene = s.scenes.find((sc) => sc.id === args.sceneId);
@@ -463,21 +508,15 @@ server.tool(
   'finish_draft',
   "Finish a Seedance 2.5 draft (a take shot with generate_video draft: true) in 1080p. The model renders the SAME shot again at full size: composition, camera path, blocking, timing, faces and sound carry over, fine detail is drawn again — and so are the draft's mistakes. A new 1080p take gives a different video; an upscale works from the draft's pixels alone. Billed as an ordinary 1080p take of the draft's length on 2.5 — about $2.84 per 5 s at 16:9 at list price. Quote it with estimate_cost once the draft has succeeded (its values are the real ones then): model 2.5, resolution 1080p, and duration, ratio and referenceVideoSec from the draft's take_status. The final is a new take in the draft's scene; the draft stays. Possible for 7 days after the draft, on the key it was shot on. A draft has one live final at a time: calling this again returns that final instead of paying twice, while a failed or deleted final can be finished again — and is paid again.",
   { taskId: z.string().describe('id of the draft take (from generate_video, take_status or scene_takes)') },
+  // not idempotent: a final is recorded only once the vendor answers, so a create the studio gave up
+  // on after the vendor took it leaves no final behind — and a retry pays again
+  RENDERS,
   async ({ taskId }) => {
+    /* The list rather than /api/tasks/:id: it asks the vendors first, so a draft that has
+       only just finished is already "succeeded" when the studio judges the finish. */
     const tasks = await api('/api/tasks');
     const draft = tasks.find((t) => t.id === taskId);
     if (!draft) throw new Error('Take not found.');
-    const already = (final) => text({
-      tasks: [brief(final)],
-      finishOf: taskId,
-      alreadyFinished: true,
-      hint: 'This draft already has a final — nothing new was rendered or billed. Check take_status.',
-    });
-    /* Checked here and not only by the studio: this file is what the agent runs whatever
-       version the studio is on, and a studio from before the one-final rule would simply
-       render — and bill — the same shot a second time. */
-    const existing = finalOf(tasks, taskId);
-    if (existing) return already(existing);
     try {
       const made = await api('/api/generate', {
         method: 'POST',
@@ -490,8 +529,19 @@ server.tool(
         hint: 'The final renders in 1080p — usually within a couple of minutes. Check take_status.',
       });
     } catch (e) {
-      // a finish that got there first — the studio names its final in the refusal
-      if (e.code === 'DRAFT_ALREADY_FINISHED' && e.body?.final) return already(e.body.final);
+      /* One live final per draft is the studio's rule alone, and its refusal names that
+         final — for a repeat after a timeout and for a finish that got there first alike.
+         Not decided here from the list as well: this file is copied out (npm,
+         /mcp-server.cjs) and never updates itself, so a copy of the rule would keep its own
+         idea of a live final after the studio's has changed. */
+      if (e.code === 'DRAFT_ALREADY_FINISHED' && e.body?.final) {
+        return text({
+          tasks: [brief(e.body.final)],
+          finishOf: taskId,
+          alreadyFinished: true,
+          hint: 'This draft already has a final — nothing new was rendered or billed. Check take_status.',
+        });
+      }
       throw e;
     }
   }
@@ -509,7 +559,7 @@ function mediaLocation(webPath) {
   return auth ? { url, auth } : { url };
 }
 
-server.tool('take_status', "Take status: queued/running/succeeded/failed + video file, last frame, token spend, and what the take was shot as: model, resolution, ratio, duration and referenceVideoSec (seconds of @clips it was billed for). A Seedance 2.5 draft carries draft: true and final — its live 1080p final, or null; a final carries finishOf, the draft it was made from.", { taskId: z.string() }, async ({ taskId }) => {
+server.tool('take_status', "Take status: queued/running/succeeded/failed + video file, last frame, token spend, and what the take was shot as: model, resolution, ratio, duration and referenceVideoSec (seconds of @clips it was billed for). A failed take carries error, words to act on, and errorCode when the studio knows the kind: OUTPUT_REFUSED is the provider's filter refusing the finished video — nothing was charged, and the same request mostly gets the same answer. A Seedance 2.5 draft carries draft: true and final — its live 1080p final, or null; a final carries finishOf, the draft it was made from.", { taskId: z.string() }, READS, async ({ taskId }) => {
   const tasks = await api('/api/tasks');
   const t = tasks.find((x) => x.id === taskId);
   if (!t) throw new Error('Take not found.');
@@ -518,6 +568,9 @@ server.tool('take_status', "Take status: queued/running/succeeded/failed + video
   // undefined fields drop out of the JSON: a plain take shows none of the draft ones
   return text({
     id: t.id, takeNo: t.takeNo, status: t.status, error: t.error,
+    // a code on the take itself (WEB-91): a refusal that arrives on polling has no request
+    // left to answer, so it never reaches the agent through studioError's [CODE] suffix
+    errorCode: t.errorCode,
     // what it was shot as — all estimate_cost needs to price a draft's final
     model: t.model, resolution: p.resolution, ratio: p.ratio, duration: p.duration,
     referenceVideoSec: t.inputSeconds,
@@ -530,7 +583,7 @@ server.tool('take_status', "Take status: queued/running/succeeded/failed + video
   });
 });
 
-server.tool('scene_takes', "Scene takes (brief, newest first). A Seedance 2.5 draft is marked draft: true; a draft's 1080p final carries finishOf.", { sceneId: z.string() }, async ({ sceneId }) => {
+server.tool('scene_takes', "Scene takes (brief, newest first). A Seedance 2.5 draft is marked draft: true; a draft's 1080p final carries finishOf.", { sceneId: z.string() }, READS, async ({ sceneId }) => {
   const tasks = await api('/api/tasks');
   return text(tasks.filter((t) => t.sceneId === sceneId).map((t) => ({
     ...brief(t), starred: t.starred || false,
@@ -539,7 +592,7 @@ server.tool('scene_takes', "Scene takes (brief, newest first). A Seedance 2.5 dr
   })));
 });
 
-server.tool('cancel_take', 'Delete a take. A queued BytePlus take is also cancelled at the provider, so its tokens are not burned. Everywhere else this is only a delete: Veo, Omni and Kling accept the render when it is created and have no cancel at all, and a take that is already running cannot be called back on any engine — it is paid for and the file is thrown away.', { taskId: z.string() }, async ({ taskId }) => {
+server.tool('cancel_take', 'Delete a take. A queued BytePlus take is also cancelled at the provider, so its tokens are not burned. Everywhere else this is only a delete: Veo, Omni and Kling accept the render when it is created and have no cancel at all, and a take that is already running cannot be called back on any engine — it is paid for and the file is thrown away.', { taskId: z.string() }, DELETES, async ({ taskId }) => {
   await api(`/api/tasks/${taskId}`, { method: 'DELETE' });
   return text('Deleted.');
 });
@@ -555,6 +608,7 @@ server.tool(
     model: z.enum(MODEL_IDS).optional().describe(MODEL_NOTE),
     referenceVideoSec: z.number().min(0).max(30).optional().describe('total length of the @clips the prompt will reference — billed as input seconds on the cheaper video-input column (Seedance only)'),
   },
+  READS,
   async ({ resolution, ratio, durationSec, variants, model, referenceVideoSec }) => {
     const s = await api('/api/state');
   /* The studio's own default, not the first row of the list: the list leads with the

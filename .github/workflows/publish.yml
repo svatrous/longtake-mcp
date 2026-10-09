@@ -1,0 +1,47 @@
+# A version tag (v1.0.1) publishes the package to npm and the server to the MCP Registry.
+# No stored tokens: npm trusts this very workflow (trusted publishing over OIDC, with
+# provenance), and the registry accepts the same GitHub identity for io.github.svatrous/*.
+# The npm side is configured on npmjs.com → longtake-mcp → Settings → Trusted Publisher,
+# and its "Workflow filename" must stay publish.yml.
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # One version in four places, or the registry turns the release down after npm took it.
+      - name: Versions agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          srv=$(node -p "require('./server.json').version")
+          srvpkg=$(node -p "require('./server.json').packages[0].version")
+          code=$(grep -oP "new McpServer\(\{[^}]*version: '\K[^']+" mcp-server.js)
+          echo "tag $tag · package.json $pkg · server.json $srv / $srvpkg · mcp-server.js $code"
+          test "$tag" = "$pkg" && test "$pkg" = "$srv" && test "$pkg" = "$srvpkg" && test "$pkg" = "$code"
+
+      # trusted publishing needs npm 11.5.1 or later
+      - run: npm install -g npm@^11.5.1
+
+      - run: npm publish
+
+      - name: MCP Registry
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
