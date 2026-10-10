@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Longtake MCP server: gives agents (Claude Code and others) tools to control the
 // studio via its REST API. Point it at your studio with two env vars:
-//   STUDIO_URL   — https://longtake.studio (or a self-hosted instance)
+//   STUDIO_URL   — https://longtake.studio, or a self-hosted instance over https (plain http only on this machine)
 //   STUDIO_TOKEN — a personal agent token from account menu → API keys → Agent access
 // Deps: npm i @modelcontextprotocol/sdk zod. Setup guide: https://longtake.studio/mcp
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -11,7 +11,8 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const STUDIO_URL = process.env.STUDIO_URL || 'http://localhost:3711';
+// one trailing slash dropped: "https://longtake.studio/" + "/api/state" would ask for //api/state
+const STUDIO_URL = (process.env.STUDIO_URL || 'http://localhost:3711').replace(/\/$/, '');
 // Preferred: a personal agent token from the studio (account menu → "API keys" →
 // "Agent access"). It signs in as the user who issued it and can be revoked alone.
 const STUDIO_TOKEN = process.env.STUDIO_TOKEN || '';
@@ -27,9 +28,25 @@ const AUTH_HEADER = STUDIO_TOKEN
 /* This file runs in two places: inside the studio's own folder, and as a copy downloaded
    from /mcp-server.cjs into a folder of the user's choosing. Everything that assumed the
    first case — the "cd here && npm start" advice, the path to the media folder — was
-   simply wrong in the second, so the repo is claimed only when server.js is really here. */
-const isLocalStudio = /^https?:\/\/(localhost|127\.0\.0\.1)/.test(STUDIO_URL);
+   simply wrong in the second, so the repo is claimed only when server.js is really here.
+   "This machine" is judged by the parsed host, not the string: the old prefix match took
+   http://localhost.example.com for a studio on the loopback. */
+const STUDIO = (() => { try { return new URL(STUDIO_URL); } catch { return null; } })();
+const isLocalStudio = ['localhost', '127.0.0.1', '[::1]'].includes(STUDIO?.hostname);
 const STUDIO_DIR = fs.existsSync(path.join(__dirname, 'server.js')) ? __dirname : null;
+
+/* The token is the whole account, so it travels over HTTPS — or to a studio on this very
+   machine, where plain http never leaves the loopback. Checked before anything is sent: a
+   mistyped http:// must not put the token on the wire even once. Without a token nothing
+   secret would travel, so an address is only refused when there is one to protect. */
+const STUDIO_URL_PROBLEM = !STUDIO || !['http:', 'https:'].includes(STUDIO.protocol)
+  ? `STUDIO_URL is not an http(s) address: ${STUDIO ? `${STUDIO.protocol}//${STUDIO.host}` : /^(localhost|[\w-]+(\.[\w-]+)+)(:\d+)?$/.test(STUDIO_URL) ? STUDIO_URL : '(not shown — it does not look like an address)'}`
+  // a login in the address would ride along with every request — and land in error messages
+  : STUDIO.username || STUDIO.password
+    ? `STUDIO_URL carries a login (${STUDIO.protocol}//…@${STUDIO.host}) — give the studio's address alone and the agent token in STUDIO_TOKEN.`
+    : STUDIO.protocol === 'http:' && !isLocalStudio && (STUDIO_TOKEN || STUDIO_PASSWORD)
+      ? `STUDIO_URL is plain http:// to ${STUDIO.host}, so the agent token (or the studio password) would cross the network unencrypted — nothing was sent. Use https:// (the cloud studio is https://longtake.studio); plain http:// is accepted only for a studio on this machine (localhost, 127.0.0.1, [::1]).`
+      : null;
 
 /* The studio labels every refusal a person can act on with a machine code —
    MODEL_NOT_ACTIVATED, NEEDS_ARK_KEY, MODERATION, RATE_LIMITED. In the browser the code is
@@ -73,6 +90,7 @@ function studioError(body, fallback) {
 }
 
 async function api(pathname, options = {}) {
+  if (STUDIO_URL_PROBLEM) throw new Error(STUDIO_URL_PROBLEM);
   let res;
   try {
     res = await fetch(STUDIO_URL + pathname, {
@@ -125,16 +143,103 @@ function parseMentions(state, projectId, prompt) {
   return { characterIds, mentionIds };
 }
 
-function fileToDataUrl(filePath) {
-  const abs = path.resolve(filePath);
-  const buf = fs.readFileSync(abs);
-  const ext = path.extname(abs).toLowerCase().replace('.', '');
-  const mime = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', ogg: 'audio/ogg',
-    // reference clips — the two containers ModelArk reads (a Blender blockout is one of these)
-    mp4: 'video/mp4', mov: 'video/quicktime' }[ext];
-  if (!mime) throw new Error(`Unsupported file format: .${ext}`);
-  return `data:${mime};base64,${buf.toString('base64')}`;
+/* Every local file that leaves this machine goes through here (upload_asset, create_character,
+   generate_mocap's photos).
+   The agent names the path, and an agent can be talked into naming the wrong one — so nothing is
+   read until the path has shown it is what the studio takes: a media extension, a regular file
+   (not a directory, a device or a pipe — nor, on Windows, a network share), no bigger than one upload request
+   can carry, and first bytes that open the way a format of that kind opens. A key, a .env or a
+   text file renamed to .png goes nowhere; what does go, goes to STUDIO_URL, into the account of
+   whoever's token this is.
+   The extension names the KIND, the bytes name the format: a PNG saved as .jpg is common and the
+   studio reads formats by signature anyway, so it goes up as what it is, under its real type. */
+const latin1 = (b, from, to) => b.length >= to && b.toString('latin1', from, to);
+// an MPEG audio frame header: sync, a real version, layer III, a bitrate and a sample rate that exist
+const mp3Frame = (b) => b.length >= 3 && b[0] === 0xff && (b[1] & 0xe0) === 0xe0
+  && ((b[1] >> 3) & 3) !== 1 && ((b[1] >> 1) & 3) === 1
+  && (b[2] >> 4) !== 0 && (b[2] >> 4) !== 15 && ((b[2] >> 2) & 3) !== 3;
+// an ID3v2 tag: "ID3", version 2–4, and a size whose four bytes are syncsafe (high bit clear)
+const id3 = (b) => latin1(b, 0, 3) === 'ID3' && b[3] >= 2 && b[3] <= 4 && b.length >= 10 && [6, 7, 8, 9].every((i) => b[i] < 0x80);
+/* ISO media (mp4, mov, m4a) opens on a box: a size that fits the file, then a type — ftyp first
+   nearly always, a bare QuickTime movie may open on another. Size 1 means a 64-bit size follows,
+   0 means "to the end of the file". */
+const isoBox = (b, size) => {
+  if (b.length < 8 || !['ftyp', 'moov', 'mdat', 'wide', 'free', 'skip', 'pnot'].includes(latin1(b, 4, 8))) return false;
+  const box = b.readUInt32BE(0);
+  return box === 0 || box === 1 || (box >= 8 && box <= size);
+};
+const FORMATS = [
+  { kind: 'image', exts: ['jpg', 'jpeg'], mime: 'image/jpeg', opens: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { kind: 'image', exts: ['png'], mime: 'image/png', opens: (b) => latin1(b, 0, 8) === '\x89PNG\r\n\x1a\n' },
+  { kind: 'image', exts: ['webp'], mime: 'image/webp', opens: (b) => latin1(b, 0, 4) === 'RIFF' && latin1(b, 8, 12) === 'WEBP' },
+  { kind: 'image', exts: ['gif'], mime: 'image/gif', opens: (b) => ['GIF87a', 'GIF89a'].includes(latin1(b, 0, 6)) },
+  { kind: 'audio', exts: ['mp3'], mime: 'audio/mpeg', opens: (b) => id3(b) || mp3Frame(b) },
+  { kind: 'audio', exts: ['wav'], mime: 'audio/wav', opens: (b) => latin1(b, 0, 4) === 'RIFF' && latin1(b, 8, 12) === 'WAVE' },
+  { kind: 'audio', exts: ['m4a'], mime: 'audio/mp4', opens: isoBox },
+  { kind: 'audio', exts: ['ogg'], mime: 'audio/ogg', opens: (b) => latin1(b, 0, 4) === 'OggS' && b[4] === 0 },
+  // reference clips — the two containers ModelArk reads (a Blender blockout is one of these)
+  { kind: 'video', exts: ['mp4'], mime: 'video/mp4', opens: isoBox },
+  { kind: 'video', exts: ['mov'], mime: 'video/quicktime', opens: isoBox },
+];
+const FORMAT_OF_EXT = Object.fromEntries(FORMATS.flatMap((f) => f.exts.map((e) => [e, f])));
+const KIND_LIST = { image: 'jpg, png, webp, gif', audio: 'mp3, wav, m4a, ogg', video: 'mp4, mov' };
+const KIND_NOUN = { image: 'an image', audio: 'an audio file', video: 'a video' };
+// /api/assets takes up to 120 MB of JSON and base64 is 4/3 of the file: anything bigger would be refused there anyway
+const UPLOAD_MAX_BYTES = Math.floor((120 * 1024 * 1024 - 64 * 1024) * 3 / 4);
+// the file's size rounded, the limit rounded down: a file just over it must never read as equal to it
+const mb = (bytes) => (bytes / 2 ** 20).toFixed(1);
+const mbFloor = (bytes) => (Math.floor(bytes / 2 ** 20 * 10) / 10).toFixed(1);
+
+/** The format of a file of this kind: the one its extension names when the bytes agree, else whichever of its kind they open as. */
+function formatOf(kind, named, head, size) {
+  if (named.opens(head, size)) return named;
+  return FORMATS.find((f) => f.kind === kind && f.opens(head, size)) || null;
 }
+
+function readMediaFile(filePath, kind) {
+  const abs = path.resolve(filePath);
+  const ext = path.extname(abs).toLowerCase().replace('.', '');
+  const named = Object.hasOwn(FORMAT_OF_EXT, ext) ? FORMAT_OF_EXT[ext] : null;
+  if (!named || (kind && named.kind !== kind)) {
+    const takes = kind ? KIND_LIST[kind] : Object.values(KIND_LIST).join(', ');
+    throw new Error(`Unsupported file format: .${ext} — ${kind ? `${kind} files` : 'files'} go up as ${takes} only.`);
+  }
+  // a network share or a device path on Windows: opening one already talks to another machine
+  if (process.platform === 'win32' && /^(\\\\|\/\/)/.test(abs)) throw new Error(`${abs} is a network or device path — only a file on this machine can be uploaded.`);
+  // non-blocking, so that a pipe dressed up as clip.mp4 cannot hang the server waiting for a writer
+  let fd;
+  try {
+    fd = fs.openSync(abs, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
+  } catch (e) {
+    throw new Error(`Cannot open ${abs}: ${e.code || e.message}`);
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${abs} is not a regular file — nothing was uploaded.`);
+    if (st.size > UPLOAD_MAX_BYTES) {
+      throw new Error(`${abs} is ${mb(st.size)} MB; one upload carries up to ${mbFloor(UPLOAD_MAX_BYTES)} MB — nothing was uploaded.`);
+    }
+    const head = Buffer.alloc(Math.min(16, st.size));
+    fs.readSync(fd, head, 0, head.length, 0);
+    const format = formatOf(named.kind, named, head, st.size);
+    if (!format) {
+      throw new Error(`${abs} is not ${KIND_NOUN[named.kind]} the studio takes (${KIND_LIST[named.kind]}): its first bytes are none of those formats — nothing was uploaded.`);
+    }
+    const buf = Buffer.alloc(st.size);
+    for (let at = 0; at < st.size;) {
+      const n = fs.readSync(fd, buf, at, st.size - at, at);
+      if (n === 0) throw new Error(`${abs} changed while it was being read — nothing was uploaded.`);
+      at += n;
+    }
+    // judged again on what was actually read: the file may have been rewritten in between
+    if (!format.opens(buf, buf.length)) throw new Error(`${abs} changed while it was being read — nothing was uploaded.`);
+    return { abs, mime: format.mime, kind: format.kind, buf };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const dataUrlOf = (file) => `data:${file.mime};base64,${file.buf.toString('base64')}`;
 
 /* Length of a voice sample, in seconds — the studio stores it and checks two limits before
    a render (each clip at least 2 s, all clips in one take within the model's window). In the
@@ -183,11 +288,9 @@ function wavSeconds(buf) {
   }
   return null;
 }
-function audioSeconds(filePath) {
+function audioSecondsOf(file) {
   try {
-    const ext = path.extname(filePath).toLowerCase();
-    const buf = fs.readFileSync(path.resolve(filePath));
-    const secs = ext === '.wav' ? wavSeconds(buf) : ext === '.mp3' ? mp3Seconds(buf) : null;
+    const secs = file.mime === 'audio/wav' ? wavSeconds(file.buf) : file.mime === 'audio/mpeg' ? mp3Seconds(file.buf) : null;
     return secs > 0 && Number.isFinite(secs) ? Number(secs.toFixed(2)) : null;
   } catch { return null; }
 }
@@ -228,12 +331,17 @@ const noRate = (m, resolution) => (m.resolutions?.includes(resolution)
    means the call acts at a vendor on the user's key (a render, a cancel). A read stays a read even
    though GET /api/tasks nudges the vendor poll along and GET /api/state scaffolds a first project
    for an account left with none. */
+/* A take id goes into a URL path, and fetch resolves "..": a free string here once let
+   "../projects/<id>" turn cancel_take into DELETE /api/projects/<id>. Ids are cgt-…, veo_…,
+   omni_…, kling_… and h3_… — letters, digits, "_" and "-". */
+const TASK_ID = z.string().regex(/^[\w-]{1,128}$/, 'a take id: letters, digits, "_" and "-" only');
+
 const READS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const CREATES = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const RENDERS = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 const DELETES = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true };
 
-const server = new McpServer({ name: 'seedance-studio', version: '1.0.1' }); // = npm longtake-mcp; bumped with it
+const server = new McpServer({ name: 'seedance-studio', version: '1.0.2' }); // = npm longtake-mcp; bumped with it
 
 server.tool(
   'studio_overview',
@@ -314,13 +422,13 @@ server.tool(
   },
   CREATES,
   async ({ projectId, filePath, name, durationSec, width, height }) => {
-    const dataUrl = fileToDataUrl(filePath);
-    const ext = path.extname(filePath).toLowerCase();
-    const isVideo = ext === '.mp4' || ext === '.mov';
-    const meta = isVideo ? videoMeta(filePath) : null;
+    const file = readMediaFile(filePath);
+    const isVideo = file.kind === 'video';
+    // ffprobe gets the absolute path just checked, not the agent's string (it opens the file again itself)
+    const meta = isVideo ? videoMeta(file.abs) : null;
     const body = {
-      projectId, name: name || path.basename(filePath), dataUrl,
-      duration: durationSec ?? (isVideo ? meta?.duration : audioSeconds(filePath) ?? undefined),
+      projectId, name: name || path.basename(filePath), dataUrl: dataUrlOf(file),
+      duration: durationSec ?? (isVideo ? meta?.duration : audioSecondsOf(file) ?? undefined),
       width: width ?? meta?.width, height: height ?? meta?.height,
     };
     const asset = await api('/api/assets', { method: 'POST', body: JSON.stringify(body) });
@@ -347,7 +455,7 @@ server.tool(
   RENDERS,
   async ({ projectId, description, photoPaths, assetName }) => {
     if (!description && !photoPaths?.length) throw new Error('Need a description and/or photos.');
-    const refs = (photoPaths || []).map(fileToDataUrl);
+    const refs = (photoPaths || []).map((photo) => dataUrlOf(readMediaFile(photo, 'image')));
     const identity =
       (refs.length ? 'The character is the EXACT person shown in the provided photos — identity must match the photos perfectly: same face, hairstyle, build, skin tone.' : '') +
       (description ? ` The character: ${description}.` : '');
@@ -388,26 +496,30 @@ server.tool(
   RENDERS,
   async ({ projectId, name, imageAssetId, imageFilePath, voiceAssetId, voiceFilePath, arkImageAsset, arkVoiceAsset, grainLevel }) => {
     /* internal: a file handed to the character belongs to the character, not to the library —
-       it is not listed, not @-mentionable and dies with it, exactly as in the cast dialog. */
+       it is not listed, not @-mentionable and dies with it, exactly as in the cast dialog.
+       Both files are read and checked before either goes up: a voice sample refused after the
+       portrait was uploaded would leave that portrait behind with no character to wear it. */
+    const image = !imageAssetId && imageFilePath ? readMediaFile(imageFilePath, 'image') : null;
+    const voice = !voiceAssetId && voiceFilePath ? readMediaFile(voiceFilePath, 'audio') : null;
     let imageId = imageAssetId || null;
-    if (!imageId && imageFilePath) {
+    if (image) {
       /* grain: the server lays the anti-moderation noise over the sheet and keeps that copy
          next to the clean one — the only version the video model is shown. Without it a
          photoreal face is refused far more often, and the studio's own advice ("attach it as
          a file, files get the grain") is something an agent cannot otherwise follow. */
       const a = await api('/api/assets', {
         method: 'POST',
-        body: JSON.stringify({ projectId, name: name + '-mockup', dataUrl: fileToDataUrl(imageFilePath), internal: true, grain: true, grainLevel }),
+        body: JSON.stringify({ projectId, name: name + '-mockup', dataUrl: dataUrlOf(image), internal: true, grain: true, grainLevel }),
       });
       imageId = a.id;
     }
     let voiceId = voiceAssetId || null;
-    if (!voiceId && voiceFilePath) {
+    if (voice) {
       /* duration: the studio checks the length of reference audio before a render, and the
          check needs a number — without it a 30 s sample only fails at the vendor. */
       const a = await api('/api/assets', {
         method: 'POST',
-        body: JSON.stringify({ projectId, name: name + '-voice', dataUrl: fileToDataUrl(voiceFilePath), duration: audioSeconds(voiceFilePath) || undefined, internal: true }),
+        body: JSON.stringify({ projectId, name: name + '-voice', dataUrl: dataUrlOf(voice), duration: audioSecondsOf(voice) || undefined, internal: true }),
       });
       voiceId = a.id;
     }
@@ -492,7 +604,7 @@ server.tool(
        The single-task route keeps it; one extra call is cheap next to a render. */
     let resolved = tasks[0]?.resolvedPrompt;
     if (!resolved && tasks[0]?.id) {
-      resolved = await api(`/api/tasks/${tasks[0].id}`).then((t) => t.resolvedPrompt).catch(() => undefined);
+      resolved = await api(`/api/tasks/${encodeURIComponent(tasks[0].id)}`).then((t) => t.resolvedPrompt).catch(() => undefined);
     }
     return text({
       tasks: tasks.map(brief),
@@ -592,8 +704,8 @@ server.tool('scene_takes', "Scene takes (brief, newest first). A Seedance 2.5 dr
   })));
 });
 
-server.tool('cancel_take', 'Delete a take. A queued BytePlus take is also cancelled at the provider, so its tokens are not burned. Everywhere else this is only a delete: Veo, Omni and Kling accept the render when it is created and have no cancel at all, and a take that is already running cannot be called back on any engine — it is paid for and the file is thrown away.', { taskId: z.string() }, DELETES, async ({ taskId }) => {
-  await api(`/api/tasks/${taskId}`, { method: 'DELETE' });
+server.tool('cancel_take', 'Delete a take. A queued BytePlus take is also cancelled at the provider, so its tokens are not burned. Everywhere else this is only a delete: Veo, Omni and Kling accept the render when it is created and have no cancel at all, and a take that is already running cannot be called back on any engine — it is paid for and the file is thrown away.', { taskId: TASK_ID }, DELETES, async ({ taskId }) => {
+  await api(`/api/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
   return text('Deleted.');
 });
 
@@ -688,5 +800,7 @@ server.tool(
 );
 
 (async () => {
+  // stderr is the host's log of this server: the refusal is said once at start, and again by every tool
+  if (STUDIO_URL_PROBLEM) console.error(`longtake-mcp: ${STUDIO_URL_PROBLEM}`);
   await server.connect(new StdioServerTransport());
 })();
