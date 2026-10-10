@@ -55,7 +55,7 @@ The full guide, with what the token can and cannot do, is at [longtake.studio/mc
 
 The token acts as your account for the work: it shoots takes on your provider keys, inside your rate limits. It cannot read or change those keys, issue or revoke tokens, or touch billing — those routes turn an agent token away. Everything else you can do it can do too, including deleting a project, so keep it out of shared configs and revoke it in the same dialog if it leaks.
 
-**Local files.** Two tools read a file from this machine: `upload_asset`, and `create_character` when given a portrait or a voice sample by path. They take only media — jpg, png, webp, gif, mp3, wav, m4a, ogg, mp4, mov — and only a regular file whose first bytes really are that format, up to 89 MB. A directory, a device, a pipe or a text file renamed to `.png` is refused before anything is read or sent. What does go goes to your studio (`STUDIO_URL`), into the account the token belongs to, and nowhere else.
+**Local files.** Three tools read a file from this machine: `upload_asset`; `create_character`, when given a portrait or a voice sample by path; and `generate_mocap`, for its reference photos. They take only media — jpg, png, webp, gif, mp3, wav, m4a, ogg, mp4, mov — and only a regular file whose first bytes really are that format, up to 89 MB. A directory, a device, a pipe or a text file renamed to `.png` is refused before anything is read or sent. What does go goes to your studio (`STUDIO_URL`), into the account the token belongs to, and nowhere else.
 
 **HTTPS only.** The token travels over `https://`, or over plain `http://` to a studio on this machine (`localhost`, `127.0.0.1`, `[::1]`). Any other `http://` address is refused before a request is made.
 
